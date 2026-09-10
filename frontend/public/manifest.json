@@ -1,0 +1,16 @@
+{
+  "name": "IDentix - Identity & Document Screening",
+  "short_name": "IDentix",
+  "description": "Offline-first AI-assisted document and identity screening platform for border and checkpoint officers.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0F172A",
+  "theme_color": "#0F172A",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    }
+  ]
+}

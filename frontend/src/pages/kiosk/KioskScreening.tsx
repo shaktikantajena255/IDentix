@@ -1,0 +1,14 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Camera, Loader2, X } from 'lucide-react';
+import { startScreening } from '../../services/legacyApi';
+
+/** Kiosk capture feeds the same real backend endpoint as officer upload. */
+export const KioskScreening: React.FC = () => {
+  const navigate = useNavigate(); const video = useRef<HTMLVideoElement>(null);
+  const [stream, setStream] = useState<MediaStream | null>(null); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
+  const startCamera = async () => { try { const next = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false }); setStream(next); if (video.current) { video.current.srcObject = next; await video.current.play(); } } catch { setError('Camera access is required to capture a document.'); } };
+  useEffect(() => { startCamera(); return () => stream?.getTracks().forEach((track) => track.stop()); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const capture = async () => { if (!video.current) return; const canvas = document.createElement('canvas'); canvas.width = video.current.videoWidth; canvas.height = video.current.videoHeight; canvas.getContext('2d')?.drawImage(video.current, 0, 0); const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.9)); if (!blob) return; setBusy(true); setError(null); try { const result = await startScreening(new File([blob], 'kiosk-document.jpg', { type: 'image/jpeg' })); stream?.getTracks().forEach((track) => track.stop()); navigate(`/officer/screening/${result.case_id}/results`, { state: { result } }); } catch (err) { setError(err instanceof Error ? err.message : 'Screening request failed.'); } finally { setBusy(false); } };
+  return <div className="min-h-screen bg-slate-950 text-white flex flex-col items-center justify-center p-6"><div className="w-full max-w-3xl"><div className="flex justify-between items-center mb-5"><div><h1 className="text-xl font-bold">IDentix Kiosk Capture</h1><p className="text-xs text-slate-400">Captured frame is submitted to the real verification backend.</p></div><button onClick={() => navigate('/kiosk')}><X /></button></div>{error && <p className="mb-4 rounded-lg bg-red-950 border border-red-700 p-3 text-sm">{error}</p>}<div className="aspect-[4/3] bg-black rounded-2xl overflow-hidden border border-slate-700"><video ref={video} className="w-full h-full object-cover" muted playsInline /></div><button disabled={busy || !stream} onClick={capture} className="mt-5 w-full rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 py-4 font-bold flex justify-center gap-2">{busy ? <Loader2 className="animate-spin" /> : <Camera />} {busy ? 'Sending to verification backend…' : 'Capture & verify document'}</button></div></div>;
+};

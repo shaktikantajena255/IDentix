@@ -686,53 +686,80 @@ def _find_mrz_lines(text: str) -> list[str]:
     A standard TD3 passport has two 44-character MRZ lines.
     OCR can introduce small deviations, so candidates from
     approximately 35-50 characters are considered.
+
+    Selection uses content-type classification to guarantee one Line-1
+    candidate (document-type + name, starts with letter+'<') and one
+    Line-2 candidate (passport number + date fields, starts alphanumeric).
+    This prevents a heavily '<'-filled Line 1 from occupying both slots.
     """
 
     if not text:
         return []
 
-    candidates = []
-
-    for raw_line in text.splitlines():
+    # Collect (normalised_line, source_row_index) for every candidate.
+    indexed = []
+    for row_idx, raw_line in enumerate(text.splitlines()):
         line = _normalize_mrz_line(raw_line)
-
         if not line:
             continue
+        if 35 <= len(line) <= 50 and "<" in line:
+            indexed.append((line, row_idx))
 
-        if (
-            35 <= len(line) <= 50
-            and "<" in line
-        ):
-            candidates.append(line)
-
-    if len(candidates) < 2:
+    if len(indexed) < 2:
         return []
 
-    # Prefer lines closest to 44 characters with many '<'.
-    candidates = sorted(
-        candidates,
-        key=lambda value: (
-            value.count("<"),
-            -abs(len(value) - 44),
-        ),
-        reverse=True,
-    )
+    # Quality score: more '<' and closer to 44 chars = better.
+    def _quality(item):
+        return (item[0].count("<"), -abs(len(item[0]) - 44))
 
-    selected = candidates[:2]
+    # Content-type classification:
+    #   Line 1 — starts with a single letter (document type) followed by '<'
+    #             e.g. "P<UTOJENA<<..."
+    #   Line 2 — starts with an alphanumeric character (passport number field)
+    #             and does NOT begin with the '<' separator
+    #             e.g. "UT00123450UTO..."
+    line1_candidates = [
+        item for item in indexed
+        if re.match(r'^[A-Z]<', item[0])
+    ]
+    line2_candidates = [
+        item for item in indexed
+        if item not in line1_candidates and not item[0].startswith('<')
+    ]
+    unclassified = [
+        item for item in indexed
+        if item not in line1_candidates and item not in line2_candidates
+    ]
 
-    # Preserve OCR order.
+    # Sort each group by quality descending.
+    line1_candidates.sort(key=_quality, reverse=True)
+    line2_candidates.sort(key=_quality, reverse=True)
+    unclassified.sort(key=_quality, reverse=True)
+
+    # Pick the best candidate from each group; fall back to unclassified.
+    selected = []
+    if line1_candidates:
+        selected.append(line1_candidates[0][0])
+    elif unclassified:
+        selected.append(unclassified.pop(0)[0])
+
+    if line2_candidates:
+        selected.append(line2_candidates[0][0])
+    elif unclassified:
+        selected.append(unclassified.pop(0)[0])
+
+    if len(selected) < 2:
+        return []
+
+    # Preserve OCR order (Line 1 before Line 2 as they appear in the document).
     ordered = []
-
     for raw_line in text.splitlines():
         normalized = _normalize_mrz_line(raw_line)
-
-        if (
-            normalized in selected
-            and normalized not in ordered
-        ):
+        if normalized in selected and normalized not in ordered:
             ordered.append(normalized)
 
     return ordered[:2]
+
 
 
 # ============================================================

@@ -52,6 +52,23 @@ def _run_ela_internal(image_path: str) -> dict:
         if max_diff == 0:
             max_diff = 1
 
+        # ── Scoring statistic: computed on RAW diff BEFORE amplification ──────
+        # Use per-pixel max across R,G,B channels so a single altered channel
+        # counts. pct_suspicious = fraction of pixels whose raw diff exceeds
+        # RAW_DIFF_THRESHOLD grey levels (absolute, pre-amplification).
+        #
+        # This replaces the previous np.max(amplified_image) approach, which
+        # was self-saturating: scale=255/max_diff always mapped the brightest
+        # raw pixel to ~255, making np.max() meaningless as a pass/fail signal.
+        ela_raw = np.array(ela_img, dtype=np.float32)   # shape (H, W, 3)
+        ela_raw_gray = ela_raw.max(axis=2)               # per-pixel channel max
+        RAW_DIFF_THRESHOLD = 8.0                         # absolute grey levels
+        pct_suspicious = float((ela_raw_gray > RAW_DIFF_THRESHOLD).mean() * 100.0)
+        raw_max = float(ela_raw_gray.max())              # kept for display only
+
+        # ── Amplification kept ONLY for the visual heatmap ────────────────────
+        # Human reviewers need contrast-stretched output to see diff regions.
+        # The amplified image is NOT used for pass/fail scoring.
         scale = 255.0 / max_diff
         ela_img = ImageEnhance.Brightness(ela_img).enhance(scale)
 
@@ -62,21 +79,20 @@ def _run_ela_internal(image_path: str) -> dict:
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         suspicious = False
-        max_ela_value = np.max(ela_cv)
         suspicious_region = None
 
-        # Thresholds:
-        # < 30   : normal JPEG recompression noise — not suspicious
-        # 30-45  : marginal — could be authentic high-frequency content or mild edit
-        # > 45   : elevated — consistent with localized recompression manipulation
+        # ── Thresholds (applied to pct_suspicious, not to amplified max) ──────
+        # SUSPICIOUS_THRESHOLD : % of pixels with raw diff > RAW_DIFF_THRESHOLD
+        # MARGINAL_THRESHOLD   : lower bound of inconclusive band
         #
-        # NOTE: ELA is forensic evidence, not proof. Authentic documents
-        # with high-frequency printing (holograms, microprint) may show
-        # elevated ELA values. Results are labelled accordingly.
-        SUSPICIOUS_THRESHOLD = 45.0
-        MARGINAL_THRESHOLD = 30.0
+        # NOTE: These starting values (5.0 / 2.0) are UNVALIDATED and must be
+        # calibrated against the full test distribution before locking.
+        # A tampered region typically pushes pct_suspicious well above genuine
+        # JPEG noise because edits affect many contiguous pixels, not just one.
+        SUSPICIOUS_THRESHOLD = 5.0    # percent of pixels
+        MARGINAL_THRESHOLD   = 2.0    # percent of pixels
 
-        if max_ela_value > SUSPICIOUS_THRESHOLD:
+        if pct_suspicious > SUSPICIOUS_THRESHOLD:
             suspicious = True
 
         if contours:
@@ -92,27 +108,34 @@ def _run_ela_internal(image_path: str) -> dict:
         if suspicious:
             result_status = "FAILED"
             result_detail = (
-                f"ELA detected elevated recompression anomaly (max ELA value: {max_ela_value:.1f}). "
+                f"ELA detected elevated recompression anomaly "
+                f"({pct_suspicious:.2f}% of pixels, raw diff>{RAW_DIFF_THRESHOLD:.0f}). "
+                f"Raw max diff: {raw_max:.1f}. "
                 "Suspicious region identified. Forensic signal: Tampered-like."
             )
-        elif max_ela_value > MARGINAL_THRESHOLD:
+        elif pct_suspicious > MARGINAL_THRESHOLD:
             result_status = "INCONCLUSIVE"
             result_detail = (
-                f"ELA shows marginal anomaly (max ELA value: {max_ela_value:.1f}). "
+                f"ELA shows marginal anomaly "
+                f"({pct_suspicious:.2f}% of pixels, raw diff>{RAW_DIFF_THRESHOLD:.0f}). "
+                f"Raw max diff: {raw_max:.1f}. "
                 "May reflect high-frequency authentic content (holograms, microprint) or mild manipulation. "
                 "Forensic signal: Inconclusive."
             )
         else:
             result_status = "PASSED"
             result_detail = (
-                f"ELA shows normal recompression noise pattern (max ELA value: {max_ela_value:.1f}). "
+                f"ELA shows normal recompression noise pattern "
+                f"({pct_suspicious:.2f}% of pixels, raw diff>{RAW_DIFF_THRESHOLD:.0f}). "
+                f"Raw max diff: {raw_max:.1f}. "
                 "No elevated manipulation evidence detected."
             )
 
         return {
             "status": result_status,
             "suspicious": suspicious,
-            "max_ela_value": float(max_ela_value),
+            "max_ela_value": raw_max,          # raw max kept for pipeline compat
+            "pct_suspicious": pct_suspicious,  # primary scoring statistic
             "suspicious_region": suspicious_region,
             "ela_image_b64": ela_b64,
             "detail": result_detail,

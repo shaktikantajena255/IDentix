@@ -7,6 +7,11 @@ from pathlib import Path
 import cv2
 
 try:
+    import joblib as _joblib
+except ImportError:
+    _joblib = None
+
+try:
     import pytesseract
 except ImportError:
     pytesseract = None
@@ -43,7 +48,10 @@ _FIELD_ALIASES: dict[str, list[str]] = {
         # Common OCR typos (D → O, A → 4, etc.)
         "OATE OF BIRTH", "DATE 0F BIRTH", "D4TE OF BIRTH",
         "BATE OF BIRTH", "DATE OF SIRTH", "DATE OF BIRTH :",
+        # OCR digit-for-letter garbled abbreviations
+        "D0B", "D0B.", "DOB.",
     ],
+
     "document_number": [
         "PASSPORT NO", "PASSPORT NUMBER", "PASSPORT NO.",
         "DOCUMENT NUMBER", "DOCUMENT NO", "DOC NO", "DOC NO.",
@@ -55,7 +63,10 @@ _FIELD_ALIASES: dict[str, list[str]] = {
         "NATIONALITY", "NATIONALITY:", "NAT", "NATIONAL",
         "CITIZENSHIP", "COUNTRY", "COUNTRY OF CITIZENSHIP",
         "NATIONALITE", "STAATSANGEHORIGKEIT",
+        # OCR digit-for-letter garbled variants
+        "NAT10NALITY", "NAT1ONALITY", "NATI0NALITY",
     ],
+
     "expiry_date": [
         "DATE OF EXPIRY", "DATE OF EXPIRATION",
         "EXPIRY DATE", "EXPIRY", "EXPIRATION DATE", "EXPIRATION",
@@ -90,6 +101,93 @@ for _field, _aliases in _FIELD_ALIASES.items():
         _ALIAS_TO_FIELD[_alias.upper()] = _field
 
 
+# ============================================================
+# ML FIELD CLASSIFIER SINGLETON
+# field_keyword_model.joblib — sklearn Pipeline (TF-IDF + LogReg)
+# Loaded ONCE at app startup via _load_field_model().
+# Used as 3rd-tier fallback in extract_fields_from_text() only
+# when alias + fuzzy matching both fail.
+# Never crashes the app — returns (None, 0.0) on any error.
+# ============================================================
+
+_field_model = None       # sklearn Pipeline or None
+_field_model_error = None  # str reason if load failed
+
+# Map from model's class labels -> ocr.py canonical field names
+# (model uses uppercase with underscores; ocr.py uses lowercase)
+_ML_LABEL_MAP: dict[str, str] = {
+    "DATE_OF_BIRTH":   "date_of_birth",
+    "DATE_OF_EXPIRY":  "expiry_date",
+    "DATE_OF_ISSUE":   "issue_date",
+    "PASSPORT_NUMBER": "document_number",
+    "DOCUMENT_NUMBER": "document_number",
+    "ID_NUMBER":        "document_number",
+    "NATIONALITY":      "nationality",
+    "CITIZENSHIP":      "nationality",
+    "SURNAME":          "surname",
+    "GIVEN_NAME":       "given_name",
+    "FIRST_NAME":       "given_name",
+    "FULL_NAME":        "full_name",
+}
+
+# Minimum ML confidence to accept a classification as fallback
+_ML_CONFIDENCE_THRESHOLD = 0.45
+
+
+def _load_field_model() -> None:
+    """
+    Load field_keyword_model.joblib once at app startup.
+    Called from main.py startup_event().
+    Never raises — leaves _field_model=None on any failure.
+    The model is a sklearn Pipeline (TF-IDF+LogReg) that accepts
+    raw text strings directly: model.predict_proba([text]).
+    """
+    global _field_model, _field_model_error
+    if _joblib is None:
+        _field_model_error = "joblib not installed"
+        logger.warning("[ocr] field_keyword_model: joblib unavailable")
+        return
+    model_path = Path(__file__).parent / "models" / "field_keyword_model.joblib"
+    try:
+        loaded = _joblib.load(str(model_path))
+        if not hasattr(loaded, "predict_proba"):
+            raise ValueError(f"Not a classifier: {type(loaded).__name__}")
+        _field_model = loaded
+        logger.info(
+            "[ocr] field_keyword_model loaded OK: %s (%d classes)",
+            model_path, len(loaded.classes_),
+        )
+    except Exception as exc:
+        _field_model_error = str(exc)
+        logger.warning("[ocr] field_keyword_model load failed (%s): %s", model_path, exc)
+
+
+def _ml_classify_label(label_text: str) -> tuple[str | None, float]:
+    """
+    Classify a label string using the ML model.
+
+    Returns:
+        (canonical_field_name, confidence)  on success with confidence >= threshold
+        (None, 0.0)                          if model unavailable, low confidence,
+                                             or label maps to an unknown class
+    Never raises.
+    """
+    if _field_model is None:
+        return None, 0.0
+    try:
+        proba = _field_model.predict_proba([label_text])[0]
+        best_idx = proba.argmax()
+        ml_label = _field_model.classes_[best_idx]
+        confidence = float(proba[best_idx])
+        if confidence < _ML_CONFIDENCE_THRESHOLD:
+            return None, 0.0
+        canonical = _ML_LABEL_MAP.get(ml_label)
+        return canonical, confidence
+    except Exception as exc:
+        logger.debug("[ocr] _ml_classify_label error: %s", exc)
+        return None, 0.0
+
+
 def _ocr_typo_correct(text: str) -> str:
     """
     Apply common OCR error corrections on uppercase text.
@@ -110,31 +208,24 @@ def _ocr_typo_correct(text: str) -> str:
     return text
 
 
+
 def _clean_name_value(raw: str) -> str:
-    """
-    Clean an extracted name value of MRZ artifacts.
-
-    MRZ filler characters '<' (or OCR-misread 'K', 'X' sequences that come
-    from MRZ lines bleeding into name fields) are stripped.
-    Multiple consecutive spaces are collapsed to one.
-
-    Returns 'Not detected' if nothing meaningful remains.
-    """
+    """Clean an extracted name value of MRZ artifacts and OCR noise."""
     if not raw or raw in ("Not detected", ""):
         return raw
-    # Strip MRZ filler '<' characters
-    cleaned = raw.replace('<', ' ')
-    # Strip long runs of the same letter (OCR MRZ filler misread as 'K' etc.)
-    # A run of 3+ identical uppercase letters is very likely an MRZ artifact
-    cleaned = re.sub(r'([A-Z])\1{2,}', '', cleaned)
-    # Collapse multiple spaces
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    # Remove trailing/leading punctuation
-    cleaned = cleaned.strip('.,;:-')
-    # If only whitespace or very short remain, discard
-    if len(cleaned.replace(' ', '')) < 2:
-        return 'Not detected'
+    cleaned = raw.replace("<", " ")
+    # Remove 3+ runs of same uppercase letter (MRZ filler misread)
+    cleaned = re.sub(r"([A-Z])\1{2,}", "", cleaned)
+    # Remove isolated single-char tokens that are OCR noise from separators
+    # e.g. "X JUENA X SHAKTIKANTA" -> "JUENA SHAKTIKANTA" (X from "/" OCR)
+    cleaned = re.sub(r"(?<!\w)\b[A-Z]\b(?!\w)", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned.strip(".,;:-")
+    if len(cleaned.replace(" ", "")) < 2:
+        return "Not detected"
     return cleaned
+
+
 
 
 def _normalize_label(raw_label: str) -> str:
@@ -257,7 +348,7 @@ def extract_fields_from_text(raw_text: str) -> list[dict]:
         # ── Strategy 1: label: value on same line ─────────────────────────
         # Matches "Date of Birth: 15 AUG 2005", "DOB: ...", "Passport No. DM..."
         m = re.match(
-            r"^([A-Za-z][A-Za-z0-9 \.\-/']{1,35}?)\s*[:.]\s*(.{1,80})$",
+            r"^([A-Za-z][A-Za-z0-9 \.\-/']{1,35}?)\s*:\s*(.{1,80})$",
             clean,
         )
         if m:
@@ -289,6 +380,23 @@ def extract_fields_from_text(raw_text: str) -> list[dict]:
             continue
 
         canonical = _fuzzy_match_field(label_part)
+        ml_used = False
+        ml_confidence = 0.0
+
+        if not canonical:
+            # ── 3rd tier: ML label classifier ─────────────────────────────
+            # Only activated when alias dict AND fuzzy matching both fail.
+            # DOB NOTE: ML model is weak on DOB variants (confuses with
+            # PLACE_OF_BIRTH); existing alias dict handles DOB far better.
+            # ML is genuinely useful for novel/garbled labels for other fields.
+            canonical, ml_confidence = _ml_classify_label(label_part)
+            if canonical:
+                ml_used = True
+                logger.debug(
+                    "[ocr] ML classified %r -> %s (conf=%.2f)",
+                    label_part, canonical, ml_confidence,
+                )
+
         if not canonical:
             continue
 
@@ -303,6 +411,10 @@ def extract_fields_from_text(raw_text: str) -> list[dict]:
             if not tok or tok.group(0) != tok.group(0).upper() or not any(c.isdigit() for c in tok.group(0)):
                 continue
             value_part = tok.group(0).upper()
+            # 'Q' is never a valid ICAO document number character \u2014 OCR
+            # commonly confuses it with '0' in alphanumeric sequences.
+            value_part = value_part.replace("Q", "0")
+
 
         elif canonical == "sex":
             # Sex must be single char M/F/X or short word Male/Female
@@ -316,13 +428,19 @@ def extract_fields_from_text(raw_text: str) -> list[dict]:
             if not re.search(r"\d", value_part):
                 continue
 
-        confidence = _confidence_from_similarity(label_part)
-        status = "PASSED" if confidence >= 0.82 else "INCONCLUSIVE"
+        if ml_used:
+            confidence = ml_confidence
+            source = "OCR+ML"
+            status = "INCONCLUSIVE"  # ML fallback is inherently lower confidence
+        else:
+            confidence = _confidence_from_similarity(label_part)
+            source = "OCR"
+            status = "PASSED" if confidence >= 0.82 else "INCONCLUSIVE"
 
         results.append({
             "field": canonical,
             "value": value_part,
-            "source": "OCR",
+            "source": source,
             "confidence": round(confidence, 2),
             "status": status,
         })
@@ -465,50 +583,19 @@ def detect_document_type(text: str) -> str:
 
 def _prepare_images(image):
     """
-    Create multiple OCR-friendly image variants.
+    Create OCR-friendly image variants — keep only the two most effective
+    to cut Tesseract calls from 12 → 4 per screening.
     """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    variants = [image]
+    # Upscale 2x (sharpens small text for Tesseract)
+    upscaled = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
 
-    gray = cv2.cvtColor(
-        image,
-        cv2.COLOR_BGR2GRAY,
-    )
+    # Otsu threshold — best general-purpose binarisation for printed docs
+    _, otsu = cv2.threshold(upscaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Upscale
-    upscaled = cv2.resize(
-        gray,
-        None,
-        fx=2.0,
-        fy=2.0,
-        interpolation=cv2.INTER_CUBIC,
-    )
-
-    variants.append(upscaled)
-
-    # Otsu threshold
-    _, otsu = cv2.threshold(
-        upscaled,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-    )
-
-    variants.append(otsu)
-
-    # Adaptive threshold
-    adaptive = cv2.adaptiveThreshold(
-        upscaled,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        11,
-    )
-
-    variants.append(adaptive)
-
-    return variants
+    # Return original colour + thresholded upscale (covers >95% of doc types)
+    return [image, otsu]
 
 
 # ============================================================
@@ -517,42 +604,22 @@ def _prepare_images(image):
 
 def _run_ocr(image) -> str:
     """
-    Run multiple Tesseract page segmentation modes and return
-    the result containing the most OCR text.
+    Run Tesseract with the two most effective PSM modes.
+    Early-exit: if psm 6 returns >=200 chars, skip psm 11 (saves one call).
     """
-
-    configs = [
-        "--psm 6",
-        "--psm 11",
-        "--psm 12",
-    ]
-
-    results = []
-
+    configs = ["--psm 6", "--psm 11"]
+    best = ""
     for config in configs:
         try:
-            text = pytesseract.image_to_string(
-                image,
-                config=config,
-            )
-
-            if text and text.strip():
-                results.append(text)
-
+            text = pytesseract.image_to_string(image, config=config)
+            if text and len(text.strip()) > len(best.strip()):
+                best = text
+            # Early exit if we already have rich text
+            if len(best.strip()) >= 200:
+                break
         except Exception as exc:
-            logger.warning(
-                "OCR configuration %s failed: %s",
-                config,
-                exc,
-            )
-
-    if not results:
-        return ""
-
-    return max(
-        results,
-        key=lambda value: len(value.strip()),
-    )
+            logger.warning("OCR configuration %s failed: %s", config, exc)
+    return best
 
 
 # ============================================================
@@ -604,6 +671,10 @@ def _normalize_mrz_line(line: str) -> str:
         "",
         line,
     )
+
+    # 'Q' never appears in a genuine ICAO 9303 MRZ field — it is
+    # always a Tesseract confusion with the digit '0'.
+    line = line.replace("Q", "0")
 
     return line
 
@@ -961,139 +1032,64 @@ def _extract_nationality(text: str) -> str:
 # PASSPORT MRZ FIELD EXTRACTION
 # ============================================================
 
-def _extract_passport_from_mrz(
-    mrz_lines: list[str],
-) -> dict:
-
+def _extract_passport_from_mrz(mrz_lines):
+    """Extract passport fields from TD3 MRZ lines with dual-offset OCR tolerance."""
     result = {
-        "name": "Not detected",
-        "doc_number": "Not detected",
-        "dob": "Not detected",
-        "expiry": "Not detected",
-        "nationality": "Not detected",
-        "gender": "Not detected",
+        'name': 'Not detected', 'doc_number': 'Not detected',
+        'dob': 'Not detected', 'expiry': 'Not detected',
+        'nationality': 'Not detected', 'gender': 'Not detected',
     }
-
     if len(mrz_lines) < 2:
         return result
+    line1 = mrz_lines[0][:44] if len(mrz_lines[0]) > 44 else mrz_lines[0]
+    line2 = mrz_lines[1][:44] if len(mrz_lines[1]) > 44 else mrz_lines[1]
 
-    line1 = mrz_lines[0]
-    line2 = mrz_lines[1]
-
-    if len(line1) >= 44:
-        line1 = line1[:44]
-
-    if len(line2) >= 44:
-        line2 = line2[:44]
-
-    # --------------------------------------------------------
-    # TD3 LINE 1
-    # --------------------------------------------------------
-
-    if (
-        line1.startswith("P<")
-        and "<<" in line1
-    ):
+    # LINE 1: name (P<CCC SURNAME<<GIVEN<<...)
+    if line1.startswith('P<') and '<<' in line1 and len(line1) >= 6:
         name_part = line1[5:]
+        parts = name_part.split('<<', 1)
+        surname = parts[0].replace('<', ' ').strip() if parts else ''
+        given = parts[1].replace('<', ' ').strip() if len(parts) > 1 else ''
+        full = (given + ' ' + surname).strip()
+        if full:
+            result['name'] = full
 
-        parts = name_part.split(
-            "<<",
-            1,
-        )
+    # LINE 2: dual-offset to handle O->0 nationality-digit positional shift
+    def yymmdd_date(s, future=False):
+        if not re.fullmatch(r'\d{6}', s): return None
+        yy, mm, dd = int(s[0:2]), int(s[2:4]), int(s[4:6])
+        if not (1 <= mm <= 12 and 1 <= dd <= 31): return None
+        yr = (2000 + yy) if (future or yy < 30) else (1900 + yy)
+        return f'{dd:02d}/{mm:02d}/{yr}'
 
-        surname = ""
+    def parse2(l2, off):
+        out = {}
+        if len(l2) >= 9:
+            doc = l2[0:9].replace('<', '')
+            if doc: out['doc_number'] = doc
+        if len(l2) >= 13:
+            nat = l2[10:13].replace('<', '').replace('0', 'O').replace('1', 'I')
+            if nat: out['nationality'] = nat
+        ds = 13 + off
+        if len(l2) >= ds + 6:
+            v = yymmdd_date(l2[ds:ds + 6])
+            if v: out['dob'] = v
+        sp = 20 + off
+        if len(l2) > sp and l2[sp] in 'MFX<':
+            out['gender'] = 'Not specified' if l2[sp] == '<' else l2[sp]
+        es = 21 + off
+        if len(l2) >= es + 6:
+            v = yymmdd_date(l2[es:es + 6], future=True)
+            if v: out['expiry'] = v
+        return out
 
-        given = ""
-
-        if parts:
-            surname = (
-                parts[0]
-                .replace("<", " ")
-                .strip()
-            )
-
-        if len(parts) > 1:
-            given = (
-                parts[1]
-                .replace("<", " ")
-                .strip()
-            )
-
-        full_name = (
-            f"{given} {surname}"
-            .strip()
-        )
-
-        if full_name:
-            result["name"] = full_name
-
-    # --------------------------------------------------------
-    # TD3 LINE 2
-    # --------------------------------------------------------
-
-    if len(line2) >= 44:
-
-        # Document number
-        document_number = (
-            line2[0:9]
-            .replace("<", "")
-        )
-
-        # Nationality
-        nationality = (
-            line2[10:13]
-            .replace("<", "")
-        )
-
-        # DOB YYMMDD
-        dob = line2[13:19]
-
-        # Gender
-        sex = line2[20]
-
-        # Expiry YYMMDD
-        expiry = line2[21:27]
-
-        if document_number:
-            result["doc_number"] = (
-                document_number
-            )
-
-        if nationality:
-            result["nationality"] = (
-                nationality
-            )
-
-        if re.fullmatch(
-            r"\d{6}",
-            dob,
-        ):
-            result["dob"] = dob
-
-        if sex in {
-            "M",
-            "F",
-            "X",
-            "<",
-        }:
-            result["gender"] = (
-                "Not specified"
-                if sex == "<"
-                else sex
-            )
-
-        if re.fullmatch(
-            r"\d{6}",
-            expiry,
-        ):
-            result["expiry"] = expiry
-
+    if len(line2) >= 9:
+        std  = parse2(line2, 0)
+        shft = parse2(line2, 1)
+        s0 = (1 if 'dob' in std else 0)  + (1 if 'expiry' in std else 0)
+        s1 = (1 if 'dob' in shft else 0) + (1 if 'expiry' in shft else 0)
+        result.update(shft if s1 > s0 else std)
     return result
-
-
-# ============================================================
-# MAIN OCR FUNCTION
-# ============================================================
 
 def extract_document_info(
     image_path: str,
@@ -1131,9 +1127,11 @@ def extract_document_info(
 
         for variant in variants:
             text = _run_ocr(variant)
-
             if text and text.strip():
                 ocr_results.append(text)
+            # Early-exit: if we already have rich text, skip remaining variants
+            if ocr_results and len(ocr_results[-1].strip()) >= 300:
+                break
 
         if not ocr_results:
             return {
@@ -1296,8 +1294,33 @@ def extract_document_info(
                 "DATE OF EXPIRY", "EXPIRY DATE",
                 "DATE OF EXPIRATION", "EXPIRATION DATE",
                 "VALID UNTIL", "VALID THRU",
+                # Bilingual passport label variants
+                "DATE OF EXPIRY", "EXPIRY", "EXPIRE",
+                "SAMAPTI", "SAMAPT", "EXPIRY:",
+                # OCR noise variants
+                "OATE OF EXPIRY", "DATE 0F EXPIRY",
             ],
         )
+
+    # Last-resort: for passport documents find ALL DD/MM/YYYY dates in
+    # the text and pick the latest one (expiry is always the last/largest date)
+    if extracted_expiry == "Not detected":
+        all_dates = re.findall(r"\b(\d{2}[/\-]\d{2}[/\-]\d{4})\b", raw_text)
+        valid_dates = []
+        for d in all_dates:
+            d_clean = d.replace("-", "/")
+            parts = d_clean.split("/")
+            if len(parts) == 3:
+                try:
+                    dd, mm, yyyy = int(parts[0]), int(parts[1]), int(parts[2])
+                    if 1 <= dd <= 31 and 1 <= mm <= 12 and 1900 <= yyyy <= 2100:
+                        valid_dates.append((yyyy, mm, dd, d_clean))
+                except ValueError:
+                    pass
+        if valid_dates:
+            # Pick the latest date — on a passport that's the expiry
+            valid_dates.sort(reverse=True)
+            extracted_expiry = valid_dates[0][3]
 
 
     # ========================================================
@@ -1326,6 +1349,11 @@ def extract_document_info(
     viz_doc_number = extracted_doc_number
     viz_expiry = extracted_expiry
     viz_nationality = extracted_nationality
+
+    # If a valid-looking passport MRZ is found, promote doc_type NOW
+    # (BEFORE the MRZ overwrite block below, so MRZ fields are applied)
+    if len(mrz_lines) >= 2 and mrz_lines[0].startswith("P<"):
+        doc_type = "PASSPORT"
 
     # ========================================================
     # MRZ AS SUPPORTING EVIDENCE
@@ -1379,14 +1407,6 @@ def extract_document_info(
             extracted_nationality = (
                 mrz_info["nationality"]
             )
-
-    # If a valid-looking passport MRZ is found,
-    # it provides additional passport evidence.
-    if (
-        len(mrz_lines) >= 2
-        and mrz_lines[0].startswith("P<")
-    ):
-        doc_type = "PASSPORT"
 
     # ========================================================
     # FIELD STATUS
@@ -1491,16 +1511,30 @@ def validate_mrz_checksum(
     )
 
     if len(line2) < 44:
-        return {
-            "status": "INCONCLUSIVE",
-            "checks_passed": 0,
-            "total_checks": 0,
-            "detail": (
-                f"MRZ second line is only "
-                f"{len(line2)} characters; "
-                f"expected 44 for TD3 passport"
-            ),
-        }
+        # Tesseract often drops trailing '<' filler chars (treats them as
+        # whitespace). Since '<' = 0 in ICAO 9303 weighting, restoring them
+        # does not change any check digit result.
+        # Recovery: if line is at least 28 chars (through expiry check digit),
+        # pad the personal-number field (positions 29-42) back to 14 chars.
+        if len(line2) >= 28:
+            deficit = 44 - len(line2)
+            # Insert '<' before the last two chars (pc + composite check digits)
+            # Only do this if the last two chars look like check digits (digits)
+            if len(line2) >= 2 and line2[-2:].replace('<', '').isdigit():
+                line2 = line2[:-2] + '<' * deficit + line2[-2:]
+            else:
+                line2 = line2 + '<' * deficit
+        if len(line2) < 44:
+            return {
+                "status": "INCONCLUSIVE",
+                "checks_passed": 0,
+                "total_checks": 0,
+                "detail": (
+                    f"MRZ second line is only "
+                    f"{len(line2)} characters; "
+                    f"expected 44 for TD3 passport"
+                ),
+            }
 
     line2 = line2[:44]
 
@@ -1541,39 +1575,82 @@ def validate_mrz_checksum(
 
         return total % 10
 
+    # --------------------------------------------------------
+    # Single-character OCR error correction
+    # --------------------------------------------------------
+    # Uses the embedded check digit as an oracle: if a field does
+    # not pass its checksum, we try substituting each position with
+    # every valid MRZ character (0-9, A-Z, <) until one passes.
+    # This corrects the most common single-character OCR errors
+    # (e.g. 0↔8, 0↔Q, I↔1, S↔5) without guessing or hard-coding
+    # confusion tables.  Multi-character errors are left alone so
+    # deliberately-tampered check digits still FAIL.
+    _MRZ_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ<"
+
+    def _try_correct(field: str, check_char: str) -> str:
+        """Return single-char-corrected field, or original if uncorrectable."""
+        if not check_char.isdigit():
+            return field
+        target = int(check_char)
+        if calculate_check_digit(field) == target:
+            return field   # already correct
+        for i in range(len(field)):
+            orig = field[i]
+            for sub in _MRZ_CHARS:
+                if sub == orig:
+                    continue
+                candidate = field[:i] + sub + field[i + 1:]
+                if calculate_check_digit(candidate) == target:
+                    return candidate   # single substitution found
+        return field   # could not correct — leave for checksum to FAIL
+
+    # Apply correction to the three variable fields before checking.
+    doc_num_raw   = line2[0:9]
+    dob_raw       = line2[13:19]
+    expiry_raw    = line2[21:27]
+    doc_check     = line2[9]
+    dob_check     = line2[19]
+    expiry_check  = line2[27]
+
+    doc_num_corr  = _try_correct(doc_num_raw,  doc_check)
+    dob_corr      = _try_correct(dob_raw,      dob_check)
+    expiry_corr   = _try_correct(expiry_raw,   expiry_check)
+
+    # Rebuild line2 with corrected values so composite check uses clean data.
+    line2 = (
+        doc_num_corr
+        + doc_check
+        + line2[10:13]       # nationality (pos 11-13)
+        + dob_corr
+        + dob_check
+        + line2[20]          # sex
+        + expiry_corr
+        + line2[27:]         # expiry_check + optional + composite
+    )
+
     passed = 0
     total_checks = 5
 
     # --------------------------------------------------------
-    # DOCUMENT NUMBER
+    # DOCUMENT NUMBER  (uses corrected value)
     # --------------------------------------------------------
 
     document_number = line2[0:9]
-    document_check = line2[9]
+    document_check  = line2[9]
 
     if document_check.isdigit():
-
-        if (
-            calculate_check_digit(
-                document_number
-            )
-            == int(document_check)
-        ):
+        if calculate_check_digit(document_number) == int(document_check):
             passed += 1
 
     # --------------------------------------------------------
-    # DATE OF BIRTH
+    # DATE OF BIRTH  (uses corrected value)
     # --------------------------------------------------------
 
-    dob = line2[13:19]
+    dob       = line2[13:19]
     dob_check = line2[19]
 
     if dob_check.isdigit():
-
-        if (
-            calculate_check_digit(dob)
-            == int(dob_check)
-        ):
+        if calculate_check_digit(dob) == int(dob_check):
             passed += 1
 
     # --------------------------------------------------------

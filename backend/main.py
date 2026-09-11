@@ -18,6 +18,7 @@ from fastapi.security import OAuth2PasswordBearer
 
 import database
 import auth
+import document_authenticity
 import pipeline
 import security
 import report
@@ -43,6 +44,9 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:5175",
         "http://localhost:4173",
         "http://localhost:3000",
     ],
@@ -64,9 +68,12 @@ def startup_event():
     else:
         logger.warning("OCR readiness check failed: %s", ocr_detail)
     security.get_fernet()
-    # Seed demo watchlist entry for TEST 07
     _seed_demo_watchlist()
+    document_authenticity._load_model()   # load RF tamper model once; logs warning if unavailable
+    ocr._load_field_model()               # load field classifier once; logs warning if unavailable
     logger.info("IDentix Backend ready.")
+
+
 
 
 def _seed_demo_watchlist():

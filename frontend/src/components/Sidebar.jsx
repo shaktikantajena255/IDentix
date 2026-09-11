@@ -1,21 +1,42 @@
+import { useState, useEffect } from 'react';
 import { useLocation, Link, useNavigate } from 'react-router-dom';
 import { Shield, LayoutDashboard, ScanLine, ClipboardList, Bell, BarChart3, Settings, LogOut } from 'lucide-react';
 
 const Sidebar = () => {
   const location = useLocation();
   const navigate = useNavigate();
-  
+  const [alertCount, setAlertCount] = useState(0);
+
   let officer = { full_name: 'Officer', badge_number: '000' };
   try {
     const saved = localStorage.getItem('identix_officer');
     if (saved) officer = JSON.parse(saved);
   } catch(e) {}
 
+  useEffect(() => {
+    const fetchAlerts = async () => {
+      try {
+        const token = localStorage.getItem('identix_token');
+        const res = await fetch('/api/history', {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const count = data.filter(r => r.risk_tier === 'HIGH_RISK' || r.risk_tier === 'REVIEW').length;
+          setAlertCount(count);
+        }
+      } catch (_) {}
+    };
+    fetchAlerts();
+    const id = setInterval(fetchAlerts, 30000);
+    return () => clearInterval(id);
+  }, []);
+
   const navItems = [
     { path: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { path: '/screening/new', label: 'New Screening', icon: ScanLine },
     { path: '/history', label: 'History', icon: ClipboardList },
-    { path: '/alerts', label: 'Alerts', icon: Bell, badge: 3 },
+    { path: '/alerts', label: 'Alerts', icon: Bell, badge: alertCount || null },
     { path: '/analytics', label: 'Analytics', icon: BarChart3 },
     { path: '/settings', label: 'Settings', icon: Settings },
   ];

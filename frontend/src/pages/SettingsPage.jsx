@@ -129,23 +129,35 @@ const SettingsPage = () => {
               <>
                 <InfoRow
                   label="OCR Engine"
-                  value={systemStatus?.ocr_available ? `Tesseract ${systemStatus?.tesseract_version || ''}` : 'Unavailable'}
-                  ok={systemStatus?.ocr_available}
+                  value={systemStatus?.ocr?.status === 'ok'
+                    ? (systemStatus.ocr.message?.split(' available at')[0] || 'Tesseract')
+                    : (systemStatus?.ocr?.message || 'Unavailable')}
+                  ok={systemStatus?.ocr?.status === 'ok'}
                 />
                 <InfoRow
                   label="Face Recognition"
-                  value={systemStatus?.face_available ? 'face_recognition loaded' : 'Unavailable'}
-                  ok={systemStatus?.face_available}
+                  value={systemStatus?.face?.status === 'ok' ? systemStatus.face.message : (systemStatus?.face?.message || 'Unavailable')}
+                  ok={systemStatus?.face?.status === 'ok'}
                 />
                 <InfoRow
                   label="ELA / Forensics"
-                  value={systemStatus?.ela_available !== false ? 'PIL + OpenCV operational' : 'Unavailable'}
-                  ok={systemStatus?.ela_available !== false}
+                  value={systemStatus?.forensic_ela?.message || 'Unavailable'}
+                  ok={systemStatus?.forensic_ela?.status === 'ok'}
+                />
+                <InfoRow
+                  label="ML Forensic Model"
+                  value={systemStatus?.ml_model?.status === 'ok' ? 'Loaded' : 'ELA-only mode (no ML model)'}
+                  ok={systemStatus?.ml_model?.status === 'ok'}
                 />
                 <InfoRow
                   label="Offline Watchlist"
-                  value={systemStatus?.watchlist_entries != null ? `${systemStatus.watchlist_entries} entries cached` : 'Loaded'}
-                  ok
+                  value={systemStatus?.watchlist?.message || 'Loaded'}
+                  ok={systemStatus?.watchlist?.status === 'ok'}
+                />
+                <InfoRow
+                  label="Encryption"
+                  value={systemStatus?.encryption?.message || 'Active'}
+                  ok={systemStatus?.encryption?.status === 'ok'}
                 />
                 <InfoRow label="PDF Report Engine" value="ReportLab operational" ok />
               </>

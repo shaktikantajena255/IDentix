@@ -81,7 +81,7 @@ def init_db():
     # Seed officers if empty
     cursor.execute("SELECT COUNT(*) FROM officers")
     if cursor.fetchone()[0] == 0:
-        pw_hash = bcrypt.hashpw(b"password123", bcrypt.gensalt()).decode('utf-8')
+        pw_hash = bcrypt.hashpw(b"password123", bcrypt.gensalt(rounds=4)).decode('utf-8')  # DEV: rounds=4
         cursor.execute('''
         INSERT INTO officers (username, password_hash, full_name, badge_number, created_at)
         VALUES (?, ?, ?, ?, datetime('now'))
@@ -100,6 +100,26 @@ def init_db():
             INSERT INTO blacklist_cache (doc_number, name, reason, added_at)
             VALUES (?, ?, ?, datetime('now'))
             ''', (doc_num, name, reason))
+
+    # Upsert guaranteed entries — always present regardless of table age.
+    # New entries added here are inserted on each init_db() call if absent.
+    guaranteed_entries = [
+        (
+            "UT0099887",
+            "UNKNOWN SUSPECT",
+            "Suspected identity fraud — flagged at Checkpoint BDR-003 on 12/08/2025",
+            "2025-08-12T00:00:00",
+        ),
+    ]
+    for doc_num, name, reason, flagged_at in guaranteed_entries:
+        cursor.execute(
+            "SELECT 1 FROM blacklist_cache WHERE doc_number = ?", (doc_num,)
+        )
+        if not cursor.fetchone():
+            cursor.execute(
+                "INSERT INTO blacklist_cache (doc_number, name, reason, added_at) VALUES (?, ?, ?, ?)",
+                (doc_num, name, reason, flagged_at),
+            )
 
     conn.commit()
     conn.close()

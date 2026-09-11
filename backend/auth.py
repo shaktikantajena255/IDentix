@@ -15,11 +15,14 @@ ACCESS_TOKEN_EXPIRE_HOURS = 8
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
+# DEV: rounds=4 for fast login (~20ms). Production should use rounds=12.
+_BCRYPT_ROUNDS = 4
+
 def verify_password(plain_password, hashed_password):
     return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 def get_password_hash(password):
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt(rounds=_BCRYPT_ROUNDS)).decode('utf-8')
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()

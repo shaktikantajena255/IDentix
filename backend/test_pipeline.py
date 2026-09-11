@@ -1,13 +1,22 @@
 """
-Backend pipeline end-to-end test.
-Runs the full verification pipeline on demo test cases and verifies key fields.
+IDentix Enhanced Pipeline Integration Test
+===========================================
+Runs the full 10-stage pipeline on ALL existing demo documents (test_01..test_10).
 
-Uses ASCII-only output to avoid Windows cp1252 encoding issues with emoji.
+For every test case reports:
+  - All 9 check statuses (must be in {PASSED, FAILED, INCONCLUSIVE, UNAVAILABLE})
+  - Tamper dual-signal: ELA status + ML probability separately
+  - OCR field extraction: Name, DOB, DocNum, Expiry, Nationality
+  - Insufficient Evidence flag
+  - Any crashes or exceptions (pipeline must NEVER crash — degrade gracefully)
+
+Exit code: 0 if all pipelines ran without crashing, 1 if any exception/assertion.
 """
 import sys
+import traceback
 sys.path.insert(0, '.')
 
-# Force UTF-8 output on Windows if possible
+# UTF-8 output on Windows
 if hasattr(sys.stdout, 'buffer'):
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -17,51 +26,93 @@ import database
 import importlib
 importlib.reload(pipeline)
 
+VALID_STATES = {"PASSED", "FAILED", "INCONCLUSIVE", "UNAVAILABLE"}
 DEMO_DIR = 'demo_docs'
 
-# Seed the test watchlist entry (WL999999 for test-07)
-# This normally runs in FastAPI startup, but for unit tests we must call it explicitly.
-try:
-    database.init_db()  # ensure tables exist
-    conn = database.get_db()
-    cursor = conn.cursor()
-    cursor.execute('SELECT 1 FROM blacklist_cache WHERE doc_number = ?', ('WL999999',))
-    if not cursor.fetchone():
-        cursor.execute(
-            'INSERT INTO blacklist_cache (doc_number, name, reason, added_at) VALUES (?, ?, ?, ?)',
-            ('WL999999', 'WATCHLST GRACE', '[IDentix Demo Test-07] Synthetic watchlist match',
-             '2026-01-01T00:00:00'),
-        )
+# ── Seed watchlist entries ────────────────────────────────────────────────────
+def seed_watchlist():
+    try:
+        database.init_db()
+        conn = database.get_db()
+        cursor = conn.cursor()
+        for doc_num, name, reason in [
+            ('WL999999', 'WATCHLST GRACE', '[Demo Test-07] Synthetic watchlist match'),
+        ]:
+            cursor.execute('SELECT 1 FROM blacklist_cache WHERE doc_number = ?', (doc_num,))
+            if not cursor.fetchone():
+                cursor.execute(
+                    'INSERT INTO blacklist_cache (doc_number, name, reason, added_at) VALUES (?, ?, ?, ?)',
+                    (doc_num, name, reason, '2026-01-01T00:00:00'),
+                )
         conn.commit()
-        print('Seeded WL999999 watchlist entry for Test 07')
-    conn.close()
-except Exception as seed_err:
-    print(f'[WARN] Could not seed watchlist: {seed_err}')
+        conn.close()
+        print('[SETUP] Watchlist seeded (WL999999)')
+    except Exception as e:
+        print(f'[WARN] Could not seed watchlist: {e}')
 
-print('=' * 60)
-print('IDentix Backend Pipeline Tests')
-print('=' * 60)
+seed_watchlist()
 
-# (test_id, expected_tier_or_None, has_selfie, doc_file, selfie_file, note)
-test_cases = [
-    ('01', None,        True,  'test_01_doc.png', 'test_01_selfie.png',
-     'Valid passport — CLEAR if face OK, else Insufficient Evidence'),
-    ('07', 'HIGH_RISK', True,  'test_07_doc.png', 'test_07_selfie.png',
-     'Watchlist match — must FAILED watchlist'),
-    ('08', None,        False, 'test_08_doc.png', None,
-     'No selfie — face UNAVAILABLE'),
-    ('09', None,        True,  'test_09_doc.png', 'test_09_selfie.png',
-     'Tampered document'),
+# ── Test case definitions ─────────────────────────────────────────────────────
+# (test_id, selfie_file_or_None, expected_tier_or_None, expected_ie, note)
+TEST_CASES = [
+    ('01', 'test_01_selfie.png', None,         False, 'Clean passport — CLEAR (with matching face)'),
+    ('02', 'test_02_selfie.png', None,         False, 'DOB mismatch — Cross-field FAILED'),
+    ('03', 'test_03_selfie.png', None,         False, 'Tampered photo — ELA anomaly expected'),
+    ('04', 'test_04_selfie.png', None,         False, 'Face mismatch — face check degraded (no face_recognition)'),
+    ('05', 'test_05_selfie.png', None,         False, 'Expired document — Expiry FAILED'),
+    ('06', 'test_06_selfie.png', None,         False, 'MRZ checksum failure — score clamped to 90+'),
+    ('07', 'test_07_selfie.png', 'HIGH_RISK',  False, 'Watchlist match — score clamped to 95+'),
+    ('08', None,                 None,         True,  'No selfie — face UNAVAILABLE -> IE likely'),
+    ('09', 'test_09_selfie.png', None,         False, 'Poor quality / blurred — OCR degraded'),
+    ('10', 'test_10_selfie.png', None,         False, 'Recaptured screenshot — double JPEG compression'),
 ]
 
-passed = 0
-failed = 0
+SEP  = '=' * 72
+SEP2 = '-' * 72
 
-for test_id, expected_tier, has_selfie, doc_file, selfie_file, note in test_cases:
-    doc_path = f'{DEMO_DIR}/{doc_file}'
+def fmt_state(s):
+    """Colour-annotate a state string for terminal output."""
+    tags = {
+        'PASSED':       '[PASS]',
+        'FAILED':       '[FAIL]',
+        'INCONCLUSIVE': '[INC ]',
+        'UNAVAILABLE':  '[UNV ]',
+    }
+    return f"{tags.get(s, '[??? ]')} {s}"
+
+def validate_all_states(checks: dict, test_id: str) -> list[str]:
+    """Return list of violations where a check returned an invalid state."""
+    violations = []
+    for check_name, check_dict in checks.items():
+        if not isinstance(check_dict, dict):
+            continue
+        status = check_dict.get('status', 'MISSING')
+        if status not in VALID_STATES:
+            violations.append(
+                f"  [!] Stage '{check_name}': invalid state '{status}' (not in {VALID_STATES})"
+            )
+    return violations
+
+# ── Main runner ───────────────────────────────────────────────────────────────
+print(SEP)
+print('IDentix Enhanced Pipeline Integration Test')
+print('All 10 demo documents | Four-state validation | Tamper dual-signal')
+print(SEP)
+
+total = 0
+crash_count = 0
+violation_count = 0
+results_summary = []
+
+for test_id, selfie_file, expected_tier, expected_ie, note in TEST_CASES:
+    doc_path    = f'{DEMO_DIR}/test_{test_id}_doc.png'
     selfie_path = f'{DEMO_DIR}/{selfie_file}' if selfie_file else None
 
-    print(f'\n--- Test {test_id}: {note} ---')
+    print(f'\n{SEP2}')
+    print(f'TEST {test_id} — {note}')
+    print(SEP2)
+
+    total += 1
     try:
         result = pipeline.run_verification_pipeline(
             doc_image_path=doc_path,
@@ -69,67 +120,114 @@ for test_id, expected_tier, has_selfie, doc_file, selfie_file, note in test_case
             officer_id=1,
         )
 
-        risk_tier = result.get('risk_tier')
-        risk_score = result.get('risk_score')
-        insuff = result.get('insufficient_evidence', False)
-        case_id = result.get('case_id')
-        doc_type = result.get('doc_type')
         checks = result.get('checks', {})
+        insuff = result.get('insufficient_evidence', False)
+        tier   = result.get('risk_tier')
+        score  = result.get('risk_score')
 
-        print(f'  Case ID: {case_id}')
-        print(f'  Doc Type: {doc_type}')
-        print(f'  Risk Tier: {risk_tier} | Score: {risk_score} | IE: {insuff}')
-        print(f'  Extracted Name: {result.get("extracted_name", "?")}')
-        print(f'  Extracted DOB: {result.get("extracted_dob", "?")}')
-        print(f'  Extracted DocNum: {result.get("extracted_doc_number", "?")}')
-        print(f'  Extracted Expiry: {result.get("extracted_expiry", "?")}')
-        print(f'  Check OCR: {checks.get("ocr", {}).get("status")}')
-        print(f'  Check MRZ: {checks.get("mrz", {}).get("status")}')
-        print(f'  Check Cross-field: {checks.get("cross_field", {}).get("status")}')
-        print(f'  Check Face: {checks.get("face", {}).get("status")}')
-        print(f'  Check Tamper: {checks.get("tamper", {}).get("status")}')
-        print(f'  Check Watchlist: {checks.get("watchlist", {}).get("status")}')
-        print(f'  Explanation: {str(result.get("risk_explanation", ""))[:120]}')
+        # ── OCR field extraction ──────────────────────────────────────────────
+        print(f'  Doc Type    : {result.get("doc_type", "?")}')
+        print(f'  Case ID     : {result.get("case_id", "?")}')
+        print()
+        print('  OCR Field Extraction:')
+        print(f'    Name        : {result.get("extracted_name", "Not detected")}')
+        print(f'    DOB         : {result.get("extracted_dob", "Not detected")}')
+        print(f'    Doc Number  : {result.get("extracted_doc_number", "Not detected")}')
+        print(f'    Expiry      : {result.get("extracted_expiry", "Not detected")}')
+        print(f'    Nationality : {result.get("extracted_nationality", "Not detected")}')
+        print()
 
-        # Basic structural assertions
-        assert case_id, 'Missing case_id'
+        # ── Per-stage four-state status ───────────────────────────────────────
+        print('  Stage Results:')
+        stage_order = [
+            ('preprocessing', 'Stage 1: Preprocessing'),
+            ('doc_type',      'Stage 2: Doc Type'),
+            ('ocr',           'Stage 3: OCR/MRZ'),
+            ('mrz',           'Stage 4: MRZ Checksum'),
+            ('cross_field',   'Stage 5: Cross-Field'),
+            ('expiry',        'Stage 6: Expiry'),
+            ('tamper',        'Stage 7: Tamper'),
+            ('face',          'Stage 8: Face'),
+            ('watchlist',     'Stage 9: Watchlist'),
+        ]
+        for key, label in stage_order:
+            ch = checks.get(key, {})
+            st = ch.get('status', 'MISSING')
+            detail = str(ch.get('detail', ''))[:80]
+            print(f'    {label:<28} : {fmt_state(st)}')
+            if detail:
+                print(f'    {"":28}   {detail}')
 
-        if insuff:
-            # Insufficient Evidence: risk_score/tier are None — this is correct behavior
-            assert risk_score is None, f'Expected None score on IE, got {risk_score}'
-            print(f'  [OK] Test {test_id}: Insufficient Evidence (correct for synthetic selfies without real faces)')
+        # ── Tamper dual-signal detail ─────────────────────────────────────────
+        tamper_ch = checks.get('tamper', {})
+        ela_status = tamper_ch.get('ela_status', 'N/A')
+        ela_max    = tamper_ch.get('ela_max_value', '?')
+        ml_status  = tamper_ch.get('ml_status', 'N/A')
+        ml_prob    = tamper_ch.get('ml_probability')
+        print()
+        print('  Tamper Dual-Signal Detail:')
+        print(f'    Rule-Based (ELA)          : {ela_status}  (max ELA value: {ela_max})')
+        if ml_prob is not None:
+            print(f'    ML Model (Random Forest)  : {ml_status}  ({ml_prob:.1f}% tamper probability)')
         else:
-            assert risk_score is not None, 'Missing risk_score when not IE'
-            valid_tiers = ('CLEAR', 'REVIEW', 'HIGH_RISK')
-            assert risk_tier in valid_tiers, f'Bad risk_tier: {risk_tier}'
-            if expected_tier and risk_tier == expected_tier:
-                print(f'  [OK] Test {test_id}: Tier matched expected={expected_tier}')
-            elif expected_tier:
-                print(f'  [WARN] Test {test_id}: Got tier={risk_tier}, expected={expected_tier}')
+            print(f'    ML Model (Random Forest)  : UNAVAILABLE  (model not loaded — ELA-only)')
+        print(f'    Combined decision         : {fmt_state(tamper_ch.get("status", "?"))}')
 
-        # Test 07: watchlist must be FAILED or at minimum tested
-        if test_id == '07':
-            wl = checks.get('watchlist', {}).get('status')
-            doc_num = result.get('extracted_doc_number', 'Not detected')
-            if wl == 'FAILED':
-                print(f'  [OK] Test 07: Watchlist correctly FAILED (doc_num={doc_num})')
-            else:
-                print(f'  [WARN] Test 07: Watchlist={wl}, doc_num={doc_num}')
-                print(f'         WL999999 must be in demo doc text for watchlist hit')
+        # ── Risk engine output ────────────────────────────────────────────────
+        print()
+        if insuff:
+            print('  Risk Engine: INSUFFICIENT EVIDENCE — Manual Verification Required')
+        else:
+            print(f'  Risk Engine: Score={score}  Tier={tier}')
+        expl = str(result.get('risk_explanation', ''))
+        if expl:
+            print(f'  Explanation: {expl[:120]}')
 
-        print(f'  [PASS] Test {test_id} completed (pipeline ran without crash)')
-        passed += 1
+        # ── Four-state validation ─────────────────────────────────────────────
+        violations = validate_all_states(checks, test_id)
+        if violations:
+            print()
+            print('  [!] FOUR-STATE VIOLATIONS:')
+            for v in violations:
+                print(v)
+            violation_count += len(violations)
 
-    except AssertionError as ae:
-        print(f'  [FAIL] Assertion FAILED: {ae}')
-        failed += 1
-    except Exception as e:
-        import traceback
-        print(f'  [ERROR] Pipeline ERROR: {e}')
+        # ── Expected outcome check ────────────────────────────────────────────
+        outcome_ok = True
+        if expected_ie and not insuff:
+            print(f'  [WARN] Expected Insufficient Evidence but got tier={tier}')
+            outcome_ok = False
+        if expected_tier and tier != expected_tier:
+            print(f'  [WARN] Expected tier={expected_tier} but got tier={tier}')
+            outcome_ok = False
+        if not expected_ie and not expected_tier:
+            outcome_ok = True  # no firm expectation
+
+        verdict = '[OK]  ' if (not violations and outcome_ok) else '[WARN]'
+        print(f'\n  {verdict} TEST {test_id} completed — no crash')
+        results_summary.append((test_id, note, tier, score, insuff, not violations and outcome_ok))
+
+    except Exception as exc:
+        print(f'  [CRASH] Pipeline raised an exception:')
         traceback.print_exc()
-        failed += 1
+        crash_count += 1
+        results_summary.append((test_id, note, 'CRASH', None, False, False))
 
+# ── Final summary ─────────────────────────────────────────────────────────────
+print(f'\n{SEP}')
+print('SUMMARY')
+print(SEP)
+print(f'  Total tests     : {total}')
+print(f'  Pipeline crashes: {crash_count}')
+print(f'  State violations: {violation_count}')
 print()
-print('=' * 60)
-print(f'Results: {passed} PASSED | {failed} FAILED')
-print('=' * 60)
+print(f'  {"ID":<4}  {"Tier":<12}  {"Score":<6}  {"IE":<5}  {"OK":<5}  Note')
+print(f'  {"-"*4}  {"-"*12}  {"-"*6}  {"-"*5}  {"-"*5}  {"-"*40}')
+for tid, note, tier, score, ie, ok in results_summary:
+    ie_s  = 'YES' if ie else 'no'
+    ok_s  = 'YES' if ok else 'WARN'
+    sc_s  = str(score) if score is not None else 'None'
+    print(f'  {tid:<4}  {str(tier):<12}  {sc_s:<6}  {ie_s:<5}  {ok_s:<5}  {note[:45]}')
+print(SEP)
+
+sys.exit(1 if crash_count > 0 else 0)

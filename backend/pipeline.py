@@ -48,18 +48,30 @@ def generate_case_id() -> str:
     return f"IDX-{date_str}-{random_hex}"
 
 
+# Cache online status for 60 s — avoids a ~1.5s socket probe on every screening.
+_online_cache: dict = {"result": None, "ts": 0.0}
+
 def _is_online() -> bool:
     """
-    Fast connectivity probe. Returns True only when a real TCP connection
-    to a known public DNS server succeeds within 1 second.
-    Never fakes connectivity.
+    Fast connectivity probe — max 0.5 s, result cached 60 s.
+    Never hangs the pipeline more than once per minute.
     """
+    now = time.time()
+    if _online_cache["result"] is not None and now - _online_cache["ts"] < 60:
+        return _online_cache["result"]
     try:
-        socket.setdefaulttimeout(1)
-        socket.create_connection(("8.8.8.8", 53))
-        return True
-    except OSError:
-        return False
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(("8.8.8.8", 53))
+        s.close()
+        result = True
+    except Exception:
+        result = False
+    finally:
+        socket.setdefaulttimeout(None)
+    _online_cache["result"] = result
+    _online_cache["ts"] = now
+    return result
 
 
 # ─── Stage 5: Cross-Field Validation ───────────────────────────────────────────
@@ -508,15 +520,22 @@ def run_verification_pipeline(
     # ── Stage 6: Document Validity (Expiry) ───────────────────────────────────
     expiry_check = _check_document_expiry(ocr_result)
 
-    # ── Stage 7: Forensic / Tamper (ELA) ──────────────────────────────────────
-    tamper_result = tamper.run_ela(doc_image_path)
+    # ── Stage 7: Forensic / Tamper (ELA + ML Random Forest) ───────────────────
+    tamper_result = tamper.run_tamper_check(doc_image_path)
     tamper_check = {
-        "status": tamper_result["status"],
-        "detail": tamper_result["detail"],
-        "ela_image_b64": tamper_result.get("ela_image_b64", ""),
+        "status":          tamper_result["status"],
+        "detail":          tamper_result["detail"],
+        "ela_image_b64":   tamper_result.get("ela_image_b64", ""),
         "suspicious_region": tamper_result.get("suspicious_region"),
-        "max_ela_value": tamper_result.get("max_ela_value", 0.0),
+        "max_ela_value":   tamper_result.get("max_ela_value", 0.0),
+        # Both signal details — exposed to frontend
+        "ela_status":      tamper_result.get("ela_status"),
+        "ela_detail":      tamper_result.get("ela_detail"),
+        "ml_status":       tamper_result.get("ml_status"),
+        "ml_probability":  tamper_result.get("ml_probability"),
+        "ml_label":        tamper_result.get("ml_label"),
     }
+
 
     # ── Stage 8: Face Verification ─────────────────────────────────────────────
     face_check = face.compare_faces(doc_image_path, selfie_image_path)

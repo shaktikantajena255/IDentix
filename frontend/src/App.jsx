@@ -5,7 +5,9 @@ import Dashboard from './pages/Dashboard';
 import NewScreening from './pages/NewScreening';
 import Results from './pages/Results';
 import History from './pages/History';
-import Placeholder from './pages/Placeholder';
+import Analytics from './pages/Analytics';
+import SettingsPage from './pages/SettingsPage';
+import Alerts from './pages/Alerts';
 
 const ProtectedRoute = ({ children }) => {
   const token = localStorage.getItem('identix_token');
@@ -50,9 +52,9 @@ const App = () => {
         <Route path="/screening/new" element={<ProtectedRoute><NewScreening /></ProtectedRoute>} />
         <Route path="/screening/:caseId/results" element={<ProtectedRoute><Results /></ProtectedRoute>} />
         <Route path="/history" element={<ProtectedRoute><History /></ProtectedRoute>} />
-        <Route path="/alerts" element={<ProtectedRoute><Placeholder pageName="Alerts" /></ProtectedRoute>} />
-        <Route path="/analytics" element={<ProtectedRoute><Placeholder pageName="Analytics" /></ProtectedRoute>} />
-        <Route path="/settings" element={<ProtectedRoute><Placeholder pageName="Settings" /></ProtectedRoute>} />
+        <Route path="/alerts" element={<ProtectedRoute><Alerts /></ProtectedRoute>} />
+        <Route path="/analytics" element={<ProtectedRoute><Analytics /></ProtectedRoute>} />
+        <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
       </Routes>
     </BrowserRouter>
   );

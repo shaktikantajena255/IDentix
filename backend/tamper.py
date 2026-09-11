@@ -85,10 +85,8 @@ def _run_ela_internal(image_path: str) -> dict:
         # SUSPICIOUS_THRESHOLD : % of pixels with raw diff > RAW_DIFF_THRESHOLD
         # MARGINAL_THRESHOLD   : lower bound of inconclusive band
         #
-        # NOTE: These starting values (5.0 / 2.0) are UNVALIDATED and must be
-        # calibrated against the full test distribution before locking.
-        # A tampered region typically pushes pct_suspicious well above genuine
-        # JPEG noise because edits affect many contiguous pixels, not just one.
+        # NOTE: These starting values (5.0 / 2.0) are UNVALIDATED starting
+        # points pending calibration against the full test distribution.
         SUSPICIOUS_THRESHOLD = 5.0    # percent of pixels
         MARGINAL_THRESHOLD   = 2.0    # percent of pixels
 
@@ -140,6 +138,7 @@ def _run_ela_internal(image_path: str) -> dict:
             "ela_image_b64": ela_b64,
             "detail": result_detail,
         }
+
 
     except Exception as e:
         logger.error("ELA failed: %s", e)

@@ -136,7 +136,7 @@ const SettingsPage = () => {
                 />
                 <InfoRow
                   label="Face Recognition"
-                  value={systemStatus?.face?.status === 'ok' ? systemStatus.face.message : (systemStatus?.face?.message || 'Unavailable')}
+                  value={systemStatus?.face?.message || 'Unavailable'}
                   ok={systemStatus?.face?.status === 'ok'}
                 />
                 <InfoRow
@@ -146,7 +146,7 @@ const SettingsPage = () => {
                 />
                 <InfoRow
                   label="ML Forensic Model"
-                  value={systemStatus?.ml_model?.status === 'ok' ? 'Loaded' : 'ELA-only mode (no ML model)'}
+                  value={systemStatus?.ml_model?.message || 'Unavailable'}
                   ok={systemStatus?.ml_model?.status === 'ok'}
                 />
                 <InfoRow

@@ -583,8 +583,8 @@ def detect_document_type(text: str) -> str:
 
 def _prepare_images(image):
     """
-    Create OCR-friendly image variants — keep only the two most effective
-    to cut Tesseract calls from 12 → 4 per screening.
+    Create OCR-friendly image variants for Tesseract.
+    Returns multiple variants to maximize text extraction on real-world docs.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
@@ -594,8 +594,12 @@ def _prepare_images(image):
     # Otsu threshold — best general-purpose binarisation for printed docs
     _, otsu = cv2.threshold(upscaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Return original colour + thresholded upscale (covers >95% of doc types)
-    return [image, otsu]
+    # CLAHE enhanced (helps with low-contrast / coloured backgrounds like US visa)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    clahe_gray = clahe.apply(upscaled)
+
+    # Return original colour + Otsu threshold + CLAHE (covers most doc types)
+    return [image, otsu, clahe_gray]
 
 
 # ============================================================
@@ -604,10 +608,10 @@ def _prepare_images(image):
 
 def _run_ocr(image) -> str:
     """
-    Run Tesseract with the two most effective PSM modes.
-    Early-exit: if psm 6 returns >=200 chars, skip psm 11 (saves one call).
+    Run Tesseract with multiple PSM modes, pick the richest result.
+    Early-exit: stop as soon as we have >= 300 chars (saves extra calls).
     """
-    configs = ["--psm 6", "--psm 11"]
+    configs = ["--psm 6", "--psm 3", "--psm 11", "--psm 4"]
     best = ""
     for config in configs:
         try:
@@ -615,11 +619,53 @@ def _run_ocr(image) -> str:
             if text and len(text.strip()) > len(best.strip()):
                 best = text
             # Early exit if we already have rich text
-            if len(best.strip()) >= 200:
+            if len(best.strip()) >= 300:
                 break
         except Exception as exc:
             logger.warning("OCR configuration %s failed: %s", config, exc)
     return best
+
+
+def _run_mrz_zone_ocr(image_bgr) -> str:
+    """
+    Dedicated MRZ-zone OCR pass.
+
+    Crops the bottom 20% of the document image (where the MRZ always lives),
+    upscales 3x, applies CLAHE contrast enhancement, then runs Tesseract with
+    a strict character whitelist [A-Z0-9<] and PSM 6 (assume single uniform
+    block of text).
+
+    This eliminates the two most common MRZ OCR failures:
+      - O/0 confusion  (whitelist forces Tesseract to output valid MRZ chars)
+      - line truncation (higher resolution + focused crop improves completeness)
+    """
+    try:
+        h, w = image_bgr.shape[:2]
+        # Bottom 20% — this is where MRZ lives on TD3 passports
+        mrz_crop = image_bgr[int(h * 0.78):, :]
+
+        gray = cv2.cvtColor(mrz_crop, cv2.COLOR_BGR2GRAY)
+
+        # 3x upscale for finer character resolution
+        upscaled = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+
+        # CLAHE for local contrast normalisation (helps with dark MRZ on passport)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(upscaled)
+
+        # Otsu binarisation
+        _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Whitelist: only valid MRZ characters
+        whitelist_config = (
+            "--psm 6 --oem 1 "
+            "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
+        )
+        text = pytesseract.image_to_string(binary, config=whitelist_config)
+        return text
+    except Exception as exc:
+        logger.warning("MRZ zone OCR failed: %s", exc)
+        return ""
 
 
 # ============================================================
@@ -690,7 +736,8 @@ def _find_mrz_lines(text: str) -> list[str]:
     Selection uses content-type classification to guarantee one Line-1
     candidate (document-type + name, starts with letter+'<') and one
     Line-2 candidate (passport number + date fields, starts alphanumeric).
-    This prevents a heavily '<'-filled Line 1 from occupying both slots.
+    This prevents a heavily '<'-filled Line 1 from occupying both slots,
+    which was a problem when zone-OCR added extra Line-1 variants.
     """
 
     if not text:
@@ -715,8 +762,7 @@ def _find_mrz_lines(text: str) -> list[str]:
     # Content-type classification:
     #   Line 1 — starts with a single letter (document type) followed by '<'
     #             e.g. "P<UTOJENA<<..."
-    #   Line 2 — starts with an alphanumeric character (passport number field)
-    #             and does NOT begin with the '<' separator
+    #   Line 2 — starts with alphanumeric (passport number field), no leading '<'
     #             e.g. "UT00123450UTO..."
     line1_candidates = [
         item for item in indexed
@@ -758,8 +804,16 @@ def _find_mrz_lines(text: str) -> list[str]:
         if normalized in selected and normalized not in ordered:
             ordered.append(normalized)
 
-    return ordered[:2]
+    ordered = ordered[:2]
 
+    # Guarantee canonical MRZ order: Line 1 (document-type + name, starts [A-Z]<)
+    # must precede Line 2 (data fields, starts alphanumeric without <).
+    # When zone-OCR appends text, Line 2 may appear at an earlier row than the
+    # zone's Line 1 copy, reversing the natural order.
+    if len(ordered) == 2 and re.match(r'^[A-Z]<', ordered[1]):
+        ordered = [ordered[1], ordered[0]]
+
+    return ordered
 
 
 # ============================================================
@@ -839,6 +893,7 @@ def _extract_name(text: str) -> str:
     Extract name from explicit Surname / Given Name fields.
 
     Avoids treating 'Issuing Post Name' as a person's name.
+    Supports both 'Surname:\nSMITH' and 'Surname SMITH' (inline) layouts.
     """
 
     lines = text.splitlines()
@@ -850,70 +905,35 @@ def _extract_name(text: str) -> str:
         clean = line.strip()
         upper = clean.upper()
 
-        # ----------------------------------------------------
-        # SURNAME
-        # ----------------------------------------------------
-        if re.match(
-            r"^SURNAME\b",
-            upper,
-        ):
-            value = re.sub(
-                r"(?i)^SURNAME\s*[:\-]?\s*",
-                "",
-                clean,
-            ).strip()
+        # Skip lines that are about issuing post, not the person's name
+        if re.search(r'ISSUING\s+POST', upper) or re.search(r'POST\s+NAME', upper):
+            continue
 
-            if value:
+        # ----------------------------------------------------
+        # SURNAME  — label on its own line, or "Surname SMITH" inline
+        # ----------------------------------------------------
+        if re.match(r"^SURNAME\b", upper):
+            # inline value after the label on the same line
+            value = re.sub(r"(?i)^SURNAME\s*[:\-]?\s*", "", clean).strip()
+
+            if value and not re.search(r'ISSUING|POST', value.upper()):
                 surname = value
-
             elif index + 1 < len(lines):
                 candidate = lines[index + 1].strip()
-
-                if candidate:
+                if candidate and not re.search(r'ISSUING|POST|GIVEN|NAME', candidate.upper()):
                     surname = candidate
 
         # ----------------------------------------------------
-        # GIVEN NAME
+        # GIVEN NAME / GIVEN NAMES
         # ----------------------------------------------------
-        elif re.match(
-            r"^GIVEN\s+NAME\b",
-            upper,
-        ):
-            value = re.sub(
-                r"(?i)^GIVEN\s+NAME\s*[:\-]?\s*",
-                "",
-                clean,
-            ).strip()
+        elif re.match(r"^GIVEN\s+NAMES?\b", upper):
+            value = re.sub(r"(?i)^GIVEN\s+NAMES?\s*[:\-]?\s*", "", clean).strip()
 
             if value:
                 given_name = value
-
             elif index + 1 < len(lines):
                 candidate = lines[index + 1].strip()
-
-                if candidate:
-                    given_name = candidate
-
-        # ----------------------------------------------------
-        # GIVEN NAMES
-        # ----------------------------------------------------
-        elif re.match(
-            r"^GIVEN\s+NAMES\b",
-            upper,
-        ):
-            value = re.sub(
-                r"(?i)^GIVEN\s+NAMES\s*[:\-]?\s*",
-                "",
-                clean,
-            ).strip()
-
-            if value:
-                given_name = value
-
-            elif index + 1 < len(lines):
-                candidate = lines[index + 1].strip()
-
-                if candidate:
+                if candidate and not re.search(r'ISSUING|POST|SURNAME', candidate.upper()):
                     given_name = candidate
 
     if surname and given_name:
@@ -925,27 +945,22 @@ def _extract_name(text: str) -> str:
     if given_name:
         return _clean_name_value(given_name)
 
-    # Generic NAME fallback.
+    # Generic NAME fallback — explicitly skip ISSUING POST NAME lines
     for index, line in enumerate(lines):
         clean = line.strip()
+        upper = clean.upper()
 
-        if re.match(
-            r"^NAME\s*[:\-]?",
-            clean,
-            re.IGNORECASE,
-        ):
-            value = re.sub(
-                r"(?i)^NAME\s*[:\-]?\s*",
-                "",
-                clean,
-            ).strip()
+        if re.search(r'ISSUING\s+POST', upper) or re.search(r'POST\s+NAME', upper):
+            continue
+
+        if re.match(r"^NAME\s*[:\-]?", clean, re.IGNORECASE):
+            value = re.sub(r"(?i)^NAME\s*[:\-]?\s*", "", clean).strip()
 
             if value:
                 return _clean_name_value(value)
 
             if index + 1 < len(lines):
                 candidate = lines[index + 1].strip()
-
                 if candidate:
                     return _clean_name_value(candidate)
 
@@ -1190,6 +1205,24 @@ def extract_document_info(
 
         # Apply OCR typo correction globally (OATE→DATE, 0F→OF, etc.)
         raw_text = _ocr_typo_correct(raw_text)
+
+        # ── Dedicated MRZ zone OCR pass ───────────────────────────────────────
+        # Run a high-resolution, whitelist-constrained OCR specifically on the
+        # bottom strip of the document where the MRZ lives. Append the result
+        # to raw_text so _find_mrz_lines has better candidates when the
+        # full-image pass produced truncated or character-confused MRZ lines.
+        #
+        # We only run this extra pass if the quick check suggests the
+        # full-image OCR missed or truncated at least one MRZ line.
+        _preliminary_mrz = _find_mrz_lines(raw_text)
+        _needs_mrz_boost = (
+            len(_preliminary_mrz) < 2
+            or any(len(ln) < 40 for ln in _preliminary_mrz)
+        )
+        if _needs_mrz_boost:
+            mrz_zone_text = _run_mrz_zone_ocr(image)
+            if mrz_zone_text.strip():
+                raw_text = raw_text + "\n" + mrz_zone_text
 
 
     except Exception as exc:

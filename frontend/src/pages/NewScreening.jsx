@@ -47,6 +47,43 @@ const NewScreening = () => {
     console.log('[IDentix] NewScreening mounted. navigator.mediaDevices available:', !!navigator.mediaDevices?.getUserMedia);
   }, []);
 
+  /**
+   * Returns the deviceId of the first real built-in webcam,
+   * skipping known virtual camera apps (Iriun, DroidCam, OBS, etc.).
+   * Falls back to undefined (browser default) if none found.
+   */
+  const getBuiltinCameraId = async () => {
+    try {
+      // We need a temporary permission grant before labels are visible
+      const tempStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      tempStream.getTracks().forEach(t => t.stop());
+
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(d => d.kind === 'videoinput');
+      console.log('[IDentix] Video devices found:', videoDevices.map(d => d.label));
+
+      const VIRTUAL_CAMERA_KEYWORDS = [
+        'iriun', 'droid', 'obs', 'virtual', 'ndi', 'snap camera', 'epoccam', 'camo', 'reincubate',
+      ];
+
+      const builtIn = videoDevices.find(d => {
+        const label = d.label.toLowerCase();
+        return !VIRTUAL_CAMERA_KEYWORDS.some(kw => label.includes(kw));
+      });
+
+      if (builtIn) {
+        console.log('[IDentix] Selected built-in camera:', builtIn.label);
+        return builtIn.deviceId;
+      }
+
+      console.warn('[IDentix] No built-in camera detected by label — using browser default.');
+      return undefined;
+    } catch (e) {
+      console.warn('[IDentix] getBuiltinCameraId failed, using default:', e.message);
+      return undefined;
+    }
+  };
+
   // KEY FIX — Bug 2: Attach selfie stream to <video> AFTER React renders the element.
   // selfieStream state becomes truthy → React renders <video ref={selfieVideoRef}> →
   // this effect fires and finds selfieVideoRef.current now valid.
@@ -111,8 +148,12 @@ const NewScreening = () => {
   const startDocCamera = async () => {
     console.log('[IDentix] Requesting document camera via getUserMedia...');
     try {
+      const deviceId = await getBuiltinCameraId();
+      const videoConstraints = deviceId
+        ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+        : { width: { ideal: 1280 }, height: { ideal: 720 } };
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'environment' },
+        video: videoConstraints,
         audio: false,
       });
       docStreamRef.current = stream;
@@ -147,12 +188,16 @@ const NewScreening = () => {
   };
 
   const startSelfieCamera = async () => {
-    console.log('[IDentix] Requesting selfie camera via getUserMedia (facingMode: user)...');
+    console.log('[IDentix] Requesting selfie camera via getUserMedia (built-in webcam preferred)...');
     setSelfieCameraFailed(false);
     setSelfieCameraError(null);
     try {
+      const deviceId = await getBuiltinCameraId();
+      const videoConstraints = deviceId
+        ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+        : { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' };
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+        video: videoConstraints,
         audio: false,
       });
       selfieStreamRef.current = stream;

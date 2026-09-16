@@ -50,12 +50,34 @@ export const FaceVerification: React.FC = () => {
     return () => stopCamera();
   }, []); // eslint-disable-line
 
+  /** Returns the deviceId of the first real built-in webcam, skipping virtual cameras. */
+  const getBuiltinCameraId = async (): Promise<string | undefined> => {
+    try {
+      const tempStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      tempStream.getTracks().forEach((t) => t.stop());
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter((d) => d.kind === 'videoinput');
+      const VIRTUAL_KEYWORDS = ['iriun', 'droid', 'obs', 'virtual', 'ndi', 'snap camera', 'epoccam', 'camo', 'reincubate'];
+      const builtIn = videoDevices.find((d) => {
+        const label = d.label.toLowerCase();
+        return !VIRTUAL_KEYWORDS.some((kw) => label.includes(kw));
+      });
+      return builtIn?.deviceId;
+    } catch {
+      return undefined;
+    }
+  };
+
   const startCamera = async () => {
     setCameraState('STARTING');
     setCameraError(null);
     try {
+      const deviceId = await getBuiltinCameraId();
+      const videoConstraints = deviceId
+        ? { deviceId: { exact: deviceId }, width: { ideal: 640 }, height: { ideal: 480 } }
+        : { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } };
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+        video: videoConstraints,
         audio: false,
       });
       streamRef.current = stream;

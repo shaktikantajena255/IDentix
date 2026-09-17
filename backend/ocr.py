@@ -455,14 +455,19 @@ def extract_fields_from_text(raw_text: str) -> list[dict]:
 # TESSERACT CONFIGURATION
 # ============================================================
 
-DEFAULT_TESSERACT_CMD = Path(
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-)
+import sys as _sys
+
+# Auto-detect default Tesseract path based on OS
+if _sys.platform == "win32":
+    _DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+else:
+    # Linux (Railway/Docker) and macOS
+    _DEFAULT_TESSERACT = "/usr/bin/tesseract"
 
 TESSERACT_CMD = Path(
     os.environ.get(
         "IDENTIX_TESSERACT_CMD",
-        str(DEFAULT_TESSERACT_CMD),
+        _DEFAULT_TESSERACT,
     )
 )
 

@@ -57,7 +57,10 @@ app.add_middleware(
         "http://localhost:3000",
         # Production — Render backend
         "https://identix-backend-hy7s.onrender.com",
-        # Production — Vercel frontends (add your Vercel URL via CORS_ORIGINS env var in Railway)
+        # Production — Vercel frontend
+        "https://i-dentix.vercel.app",
+        "https://i-dentix-qn838mkuq-shaktikantajena255.vercel.app",
+        # Extra origins from env var (comma-separated)
         *_extra_origins,
     ],
     allow_credentials=True,

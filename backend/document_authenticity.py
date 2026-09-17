@@ -10,19 +10,8 @@ import matplotlib.pyplot as plt
 
 from PIL import Image, ImageChops, ImageEnhance, ImageFilter
 
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import (
-    GroupShuffleSplit,
-    GroupKFold
-)
-from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    classification_report,
-    confusion_matrix
-)
+# sklearn/scipy are imported lazily (inside functions) to avoid
+# Application Control policy blocking DLL load at server startup.
 
 
 # ============================================================
@@ -1132,6 +1121,7 @@ def tune_hyperparameters(dataset):
             y_train = y.iloc[train_idx]
             y_test = y.iloc[test_idx]
 
+            from sklearn.ensemble import RandomForestClassifier  # lazy import
             model = RandomForestClassifier(
                 n_estimators=params[
                     "n_estimators"
@@ -1259,6 +1249,7 @@ def cross_validate_model(
         y_train = y.iloc[train_idx]
         y_test = y.iloc[test_idx]
 
+        from sklearn.ensemble import RandomForestClassifier  # lazy import
         model = RandomForestClassifier(
             n_estimators=best_params[
                 "n_estimators"
@@ -1636,6 +1627,7 @@ def train_model(dataset, best_params):
     # Random Forest
     # ------------------------------------------
 
+    from sklearn.ensemble import RandomForestClassifier  # lazy import
     model = RandomForestClassifier(
         n_estimators=best_params[
             "n_estimators"

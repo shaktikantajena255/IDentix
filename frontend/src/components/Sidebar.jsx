@@ -22,7 +22,7 @@ const Sidebar = () => {
         });
         if (res.ok) {
           const data = await res.json();
-          const count = data.filter(r => r.risk_tier === 'HIGH_RISK' || r.risk_tier === 'REVIEW').length;
+          const count = data.filter(r => r.risk_tier === 'HIGH_RISK').length;
           setAlertCount(count);
         }
       } catch (_) {}

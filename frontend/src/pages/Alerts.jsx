@@ -49,7 +49,7 @@ const Alerts = () => {
         speak('New high risk alert detected. Immediate attention required.');
       }
       prevHighRef.current = highCount;
-      setLastCount(alerts.length);
+      setLastCount(highCount);
       setRecords(alerts);
     } catch (_) {}
     finally { setLoading(false); setRefreshing(false); }

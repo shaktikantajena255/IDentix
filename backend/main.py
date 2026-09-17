@@ -55,7 +55,8 @@ app.add_middleware(
         "http://localhost:5175",
         "http://localhost:4173",
         "http://localhost:3000",
-        # Production — Render backend
+        # Production — Render backend (Docker with OCR)
+        "https://identix.onrender.com",
         "https://identix-backend-hy7s.onrender.com",
         # Production — Vercel frontend
         "https://i-dentix.vercel.app",

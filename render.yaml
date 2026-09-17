@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: identix-backend
+    env: python
+    rootDir: backend
+    buildCommand: "apt-get install -y tesseract-ocr tesseract-ocr-eng libgl1 libglib2.0-0 && pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: SECRET_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.12"

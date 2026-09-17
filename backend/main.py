@@ -55,8 +55,8 @@ app.add_middleware(
         "http://localhost:5175",
         "http://localhost:4173",
         "http://localhost:3000",
-        # Production — Railway backend (self-reference for health probes)
-        "https://identix-production-3ac2.up.railway.app",
+        # Production — Railway backend
+        "https://identix-production-8b56.up.railway.app",
         # Production — Vercel frontends (add your Vercel URL via CORS_ORIGINS env var in Railway)
         *_extra_origins,
     ],

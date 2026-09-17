@@ -61,14 +61,12 @@ def _is_online() -> bool:
         return _online_cache["result"]
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.5)
+        s.settimeout(0.3)
         s.connect(("8.8.8.8", 53))
         s.close()
         result = True
     except Exception:
         result = False
-    finally:
-        socket.setdefaulttimeout(None)
     _online_cache["result"] = result
     _online_cache["ts"] = now
     return result

@@ -39,9 +39,15 @@ app = FastAPI(
     redoc_url="/api/redoc",
 )
 
+import os as _os
+
+# CORS origins — extend via CORS_ORIGINS env var (comma-separated) for production
+_extra_origins = [o.strip() for o in _os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        # Local development
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:5174",
@@ -49,6 +55,10 @@ app.add_middleware(
         "http://localhost:5175",
         "http://localhost:4173",
         "http://localhost:3000",
+        # Production — Railway backend (self-reference for health probes)
+        "https://identix-production-3ac2.up.railway.app",
+        # Production — Vercel frontends (add your Vercel URL via CORS_ORIGINS env var in Railway)
+        *_extra_origins,
     ],
     allow_credentials=True,
     allow_methods=["*"],

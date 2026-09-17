@@ -1,7 +1,9 @@
 import axios from 'axios';
 
+// In development: empty string — Vite proxy handles /api/* → localhost:8000
+// In production (Vercel etc.): set VITE_API_URL=https://your-backend.railway.app
 const api = axios.create({
-  baseURL: '',
+  baseURL: import.meta.env.VITE_API_URL || '',
 });
 
 // Attach JWT token to every request

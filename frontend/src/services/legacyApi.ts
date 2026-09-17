@@ -1,7 +1,11 @@
 /**
  * Transport for the screening backend currently served by backend/main.py.
- * Requests are deliberately relative so Vite's existing /api proxy is used.
+ * In development: requests are relative — Vite proxy forwards /api/* → localhost:8000.
+ * In production (Vercel): set VITE_API_URL=https://your-backend.railway.app
  */
+
+// Empty string in dev (proxy handles it); full URL in production.
+const API_BASE: string = (import.meta.env.VITE_API_URL as string) || '';
 
 const TOKEN_KEY = 'identix_access_token';
 
@@ -18,7 +22,7 @@ async function request(path: string, init: RequestInit = {}) {
 
   let response: Response;
   try {
-    response = await fetch(path, { ...init, headers });
+    response = await fetch(`${API_BASE}${path}`, { ...init, headers });
   } catch {
     throw new LegacyApiError(0, 'The IDentix backend is unavailable. Check that FastAPI is running.');
   }

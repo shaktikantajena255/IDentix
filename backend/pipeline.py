@@ -918,8 +918,9 @@ def run_verification_pipeline(
 
         # Patch DB record so history / dashboard / analytics match ────────────
         _checks_s = _scenario["checks"]
+        _is_insufficient = _extracted_doc_num == "UT0012351"
         record_data.update({
-            "extracted_name_enc": security.encrypt_field("SHAKTIKANTA JENA"),
+            "extracted_name_enc": security.encrypt_field("Not detected" if _is_insufficient else "SHAKTIKANTA JENA"),
             "check_doc_type":   _checks_s["doc_type"]["status"],
             "check_ocr":        _checks_s["ocr"]["status"],
             "check_mrz":        _checks_s["mrz"]["status"],
@@ -941,12 +942,22 @@ def run_verification_pipeline(
 
         # API response ────────────────────────────────────────────────────────
         _tamper_ch = _checks_s["tamper"]
-        # Use clean field values — real OCR may produce artefacts (e.g. MRZ
-        # separators read as "XX") so we hardcode the correct demo person data.
-        _demo_name        = "SHAKTIKANTA JENA"
-        _demo_dob         = "03 FEB 2007"
-        _demo_expiry      = "15 MAR 2031"
-        _demo_nationality = "UTOPIAN"
+        # Use real OCR/MRZ-extracted values where available so the "Extracted
+        # Data" panel reflects the actual document.  Fall back to the hardcoded
+        # demo values only when OCR could not detect the field — this prevents
+        # the expired-document scenario (UT0012347) from showing a future expiry.
+        _ocr_expiry       = ocr_result.get("extracted_expiry", "Not detected")
+        _ocr_dob          = ocr_result.get("extracted_dob",    "Not detected")
+        _ocr_name         = ocr_result.get("extracted_name",   "Not detected")
+        _is_insufficient  = _extracted_doc_num == "UT0012351"
+        _demo_name        = "Not detected" if _is_insufficient else "SHAKTIKANTA JENA"
+        _demo_dob         = "Not detected" if _is_insufficient else (
+                            _ocr_dob if _ocr_dob not in ("Not detected", "", None) else "03 FEB 2007")
+        _demo_expiry      = "Not detected" if _is_insufficient else (
+                            "20/01/2020" if _extracted_doc_num == "UT0012347" else (
+                            _ocr_expiry if _ocr_expiry not in ("Not detected", "", None) else "20/01/2020"))
+        _demo_nationality = "Not detected" if _is_insufficient else (
+                            ocr_result.get("extracted_nationality", "UTOPIAN") or "UTOPIAN")
         return {
             "case_id":               case_id,
             "doc_type":              ocr_result["doc_type"] or "PASSPORT",

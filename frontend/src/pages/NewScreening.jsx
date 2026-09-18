@@ -262,9 +262,6 @@ const NewScreening = () => {
       if (i < stages.length) {
         setProcessingStage(stages[i].name);
         setProcessingProgress(stages[i].progress);
-        if (i === 0 || i === 2 || i === 4) {
-          speak(stages[i].name + ' in progress');
-        }
         i++;
       }
     }, 800);
@@ -278,7 +275,7 @@ const NewScreening = () => {
 
   const handleStartVerification = async () => {
     if (!documentFile || !selfieReady) return;
-    speak("Starting verification pipeline. Please wait.");
+    speak("Verification starting. Please wait.");
     setIsProcessing(true);
     setError(null);
 
